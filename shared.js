@@ -11,6 +11,19 @@ const CONFIG = {
   maxPacketSize: 1200,
 };
 
+const applicationRtpFraming = false; // Application RTP framing of encoded chunks
+
+// RTP constants
+const rtpHeaderSize = 12;
+const payloadDescSize = 10; // stream version, isKeyFrame, frameId, packetSeq, numPackets
+const totalHeaderSize = rtpHeaderSize + payloadDescSize;
+const rtpVersion = 2;
+const rtpPayloadType = 1; // PT is 1 when application framing is used
+
+// RTP sender state
+let rtpSequenceNumber = 0;
+const rtpSSRC = 0;
+
 const byob_support = typeof RtcReceivedPacket !== 'undefined' && RtcReceivedPacket && 'copyPayloadTo' in RtcReceivedPacket.prototype;
 const writable_change_event_support = 'onwritablechange' in RtcTransport.prototype;
 
@@ -117,12 +130,25 @@ function handleEncodedChunk(transport, chunk, version, frameId) {
   chunk.copyTo(chunkData);
 
   const packets = [];
-  const maxPayloadSize = CONFIG.maxPacketSize - 10; // 10 bytes for header
+  let maxPayloadSize;
+  let payloadDescOffset;
+  if (applicationRtpFraming) {
+    maxPayloadSize = CONFIG.maxPacketSize - totalHeaderSize;
+    payloadDescOffset = rtpHeaderSize;
+  } else {
+    maxPayloadSize = CONFIG.maxPacketSize - payloadDescSize;
+    payloadDescOffset = 0;
+  }
   const numPackets = Math.ceil(chunkData.byteLength / maxPayloadSize);
 
   for (let i = 0, packetSeq = 0; i < chunkData.byteLength; i += maxPayloadSize, packetSeq++) {
     const end = Math.min(i + maxPayloadSize, chunkData.byteLength);
-    const packet_length = end - i + 10;
+    let packet_length;
+    if (applicationRtpFraming) {
+      packet_length = end - i + totalHeaderSize;
+    } else {
+      packet_length = end - i + payloadDescSize;
+    }
     let packet_buffer;
     if (byob_support) {
       packet_buffer = bufferPool.pop();
@@ -131,13 +157,24 @@ function handleEncodedChunk(transport, chunk, version, frameId) {
       packet_buffer = new ArrayBuffer(packet_length);
     }
     const packetView = new DataView(packet_buffer, 0, packet_length);
-    packetView.setUint8(0, version);
-    packetView.setUint8(1, chunk.type === "key" ? 1 : 0);
-    packetView.setUint16(2, frameId, false); // big-endian
-    packetView.setUint8(4, packetSeq);
-    packetView.setUint8(5, numPackets);
-    packetView.setUint32(6, chunk.timestamp);
-    new Uint8Array(packet_buffer, 10).set(chunkData.slice(i, end));
+    if (applicationRtpFraming) {
+      packetView.setUint8(0, rtpVersion << 6);
+      packetView.setUint8(1, rtpPayloadType & 0x7F); // Marker bit is 0 since no feedback information is present
+      packetView.setUint16(2, rtpSequenceNumber & 0xFFFF, false);
+      rtpSequenceNumber++;
+      packetView.setUint32(4, chunk.timestamp, false);
+      packetView.setUint32(8, rtpSSRC, false);
+    }
+
+    packetView.setUint8(payloadDescOffset + 0, version);
+    packetView.setUint8(payloadDescOffset + 1, chunk.type === "key" ? 1 : 0);
+    packetView.setUint16(payloadDescOffset + 2, frameId, false);
+    packetView.setUint8(payloadDescOffset + 4, packetSeq);
+    packetView.setUint8(payloadDescOffset + 5, numPackets);
+    packetView.setUint32(payloadDescOffset + 6, chunk.timestamp);
+
+    new Uint8Array(packet_buffer, payloadDescOffset + payloadDescSize).set(chunkData.slice(i, end));
+
     packets.push({ data: byob_support ? packetView : packet_buffer});
   }
 
@@ -203,19 +240,45 @@ function decodeAvailableFrames(pendingPackets, reassemblyBuffer, decoder, stream
   while (pendingPackets.length > 0) {
     const packet = pendingPackets.shift();
     const packetView = new DataView(byob_support ? packet.buffer : packet);
-    const version = packetView.getUint8(0);
 
-    if (version !== streamVersion) {
-      // Old packet from a previous stream, discard
+    // RTCP packet types occupy byte 1 values 200-206.
+    const packetType = packetView.getUint8(1);
+    if (packetType >= 200 && packetType <= 206) {
+      const rtcpTypeNames = {
+        200: 'SR (Sender Report)',
+        201: 'RR (Receiver Report)',
+        202: 'SDES (Source Description)',
+        203: 'BYE (Goodbye)',
+        204: 'APP (Application-Defined)',
+        205: 'RTPFB (Transport Layer Feedback)',
+        206: 'PSFB (Payload-Specific Feedback)',
+      };
+      console.log(`Received RTCP packet: ${rtcpTypeNames[packetType]} (type=${packetType})`);
+      bufferPool.push(packet.buffer);
       continue;
     }
 
-    const isKeyFrame = packetView.getUint8(1) === 1;
-    const frameId = packetView.getUint16(2, false);
-    const packetSeq = packetView.getUint8(4);
-    const numPackets = packetView.getUint8(5);
-    const timestamp = packetView.getUint32(6, false);
-    const data = new Uint8Array(byob_support ? packet.buffer : packet, 10, packet.byteLength - 10);
+    if (applicationRtpFraming) {
+      payloadDescOffset = rtpHeaderSize;
+    } else {
+      payloadDescOffset = 0;
+    }
+
+    const version = packetView.getUint8(payloadDescOffset);
+
+    if (version !== streamVersion) {
+      // Old packet from a previous stream, discard
+      bufferPool.push(packet.buffer);
+      continue;
+    }
+
+    const isKeyFrame = packetView.getUint8(payloadDescOffset + 1) === 1;
+    const frameId = packetView.getUint16(payloadDescOffset + 2, false);
+    const packetSeq = packetView.getUint8(payloadDescOffset + 4);
+    const numPackets = packetView.getUint8(payloadDescOffset + 5);
+    const timestamp = packetView.getUint32(payloadDescOffset + 6, false);
+    const data = new Uint8Array(byob_support ? packet.buffer :
+      packet, payloadDescOffset + payloadDescSize, packet.byteLength - (payloadDescOffset + payloadDescSize));
 
     if (!reassemblyBuffer[frameId]) {
       reassemblyBuffer[frameId] = {

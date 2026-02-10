@@ -13,7 +13,7 @@ let streamVersion = 0;
 const reassemblyBuffer = {};
 const bufferPoolSize = 50;
 let bufferPool = byob_support ? [...Array(bufferPoolSize)].map(() => {
-  return new ArrayBuffer(CONFIG.maxPacketSize);
+  return new ArrayBuffer(CONFIG.maxPacketSize + 12); // +12 for potential RTP header
 }) : [];
 let pendingPackets = [];
 let renderedFrames = 0;
